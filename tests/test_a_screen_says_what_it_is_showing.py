@@ -1,0 +1,353 @@
+"""What a screen looks like when it has nothing to show, and what shape it takes.
+
+⛔ FOUR STATES USED TO DRAW ONE BLACK RECTANGLE. A pane waiting for its first
+frame, a browser with no tab open, one that stopped answering and a capture that
+failed were pixel-identical: an empty dark box with a name under it. Three of
+those four are ordinary and one is a failure, and the product said the same
+thing about all of them - which is how a pane that is simply patient came to
+look like a pane that is broken.
+
+⛔ AND THE CELL USED TO BE A CONTAINER, NOT A FRAME. Measured on the bench: a
+1280x688 window in a one-up cell drew 40% of the card as black, and at two-up two
+cards of equal size held pictures of unequal size, so the smaller one read as a
+mistake rather than as a narrower window. The frame now takes the picture's own
+shape, cropped of the browser chrome, and the whole of it is executed here
+rather than described - it is arithmetic over two natural dimensions.
+"""
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+
+import pytest
+
+from invisible_playwright_mcp.ui import PAGE
+
+NODE = shutil.which("node")
+pytestmark = pytest.mark.skipif(not NODE, reason="needs node to EXECUTE the page")
+
+#: A DOM small enough to print, with the four things this code touches:
+#: children, a dataset, a style that remembers custom properties, and a
+#: querySelector that understands a class or a tag.
+SHIM = r"""
+class N {
+  constructor(tag){
+    this.tag = tag; this.kids = []; this.className = ''; this.dataset = {};
+    this.attrs = {}; this.hidden = false; this.title = ''; this._text = null;
+    this.style = { _p:{}, setProperty(k,v){ this._p[k] = String(v) },
+                   getPropertyValue(k){ return this._p[k] || '' } };
+  }
+  get textContent(){
+    return this._text != null ? this._text : this.kids.map(k => k.textContent).join('');
+  }
+  set textContent(v){ this._text = String(v); this.kids = []; }
+  appendChild(n){ this.kids.push(n); this._text = null; return n; }
+  append(...xs){ for(const x of xs) this.appendChild(x); }
+  setAttribute(k, v){ this.attrs[k] = String(v); }
+  querySelector(sel){
+    const hit = n => sel.startsWith('.') ? (' ' + n.className + ' ').includes(' ' + sel.slice(1) + ' ')
+                                         : n.tag === sel;
+    const walk = n => { for(const k of n.kids){ if(hit(k)) return k;
+                                                const deep = walk(k); if(deep) return deep; }
+                        return null; };
+    return walk(this);
+  }
+}
+const document = { createElement: t => new N(t), createTextNode: t => { const n = new N('#text'); n._text = t; return n; } };
+const el = (t,c,x) => { const e = document.createElement(t);
+                        if(c) e.className = c; if(x != null) e.textContent = x; return e; };
+const stage = {fleet: [], focus: 'b-two', pinned: null, grid: 1, turn: 0};
+const watched = () => stage.pinned || stage.focus;
+function watchThis(){}
+function tree(n){ return {tag: n.tag, cls: n.className, hidden: n.hidden,
+                          data: n.dataset, text: n._text,
+                          style: n.style._p, kids: n.kids.map(tree)}; }
+"""
+
+FIRST = "const CHROME = 0.083;"
+LAST = "/* Built from elements with textContent and never innerHTML"
+CELLS_FIRST = "function blank(cell, why){"
+CELLS_LAST = "function drawStage(){"
+
+
+def one(name: str) -> str:
+    """One top-level function, from its `function` to its closing brace.
+
+    Bounding a slice by "the next function" pulls in whatever sits between
+    them - here a line that wires a click handler through `$` - and a slice
+    that drags in the page's wiring stops being a unit and becomes half a page
+    that will not run.
+    """
+    i = PAGE.index("function %s(" % name)
+    j = PAGE.index("\n}", i) + 2
+    return PAGE[i:j]
+
+
+def run(extra: str, body: str = None) -> dict:
+    if body is None:
+        body = PAGE[PAGE.index(FIRST):PAGE.index(LAST)]
+    js = SHIM + body + "\n" + extra
+    done = subprocess.run([NODE, "-e", js], capture_output=True, text=True,
+                          encoding="utf-8", timeout=30)
+    assert done.returncode == 0, "the page threw:\n%s" % done.stderr
+    return json.loads(done.stdout)
+
+
+def cells(extra: str) -> dict:
+    """Everything from the chrome crop down to the end of `screenFor`."""
+    body = (PAGE[PAGE.index(FIRST):PAGE.index(LAST)]
+            + PAGE[PAGE.index(CELLS_FIRST):PAGE.index(CELLS_LAST)])
+    done = subprocess.run([NODE, "-e", SHIM + body + "\n" + extra],
+                          capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert done.returncode == 0, "the page threw:\n%s" % done.stderr
+    return json.loads(done.stdout)
+
+
+def test_the_frame_takes_the_shape_of_the_window_it_shows():
+    """⛔ THE FRAME IS THE PICTURE, NOT THE CELL. Two numbers do it: the crop,
+    as a fraction of the picture's WIDTH because that is what a percentage
+    margin resolves against, and the shape that is left after cropping. Both
+    are set once per shape, so nothing is measured and nothing is recomputed on
+    resize - the version before this one read the box on every frame.
+
+    Known-bad, three: drop the crop, express it against the height instead of
+    the width, or forget the ratio and leave every frame at 16:10 - which is
+    the state this pane was in when a 4:3 window drew inside a 16:10 box.
+    """
+    shots = run("""
+      const out = [];
+      for(const [w, h] of [[1280,688],[1024,768],[1440,812],[800,600]]){
+        const box = el('div','frame'), cell = el('div','screen');
+        cell.appendChild(box);
+        shapeFrom(cell, {naturalWidth: w, naturalHeight: h});
+        out.push({w, h, arn: Number(box.style.getPropertyValue('--arn')),
+                  cut: Number(box.style.getPropertyValue('--cut').replace('%','')),
+                  shape: cell.dataset.shape});
+      }
+      process.stdout.write(JSON.stringify(out));
+    """)
+    for s in shots:
+        w, h = s["w"], s["h"]
+        seen = h * (1 - 0.083)
+        assert abs(s["arn"] - w / seen) < 0.001, (
+            "a %dx%d window is framed at %.3f, and cropped of its chrome it is "
+            "%.3f wide for every one tall" % (w, h, s["arn"], w / seen))
+        # The crop is a share of the HEIGHT, and a percentage margin resolves
+        # against the WIDTH: the conversion is the whole point of the number.
+        assert abs(s["cut"] - 0.083 * h / w * 100) < 0.01, (
+            "%dx%d is cropped by %.2f%% of its width" % (w, h, s["cut"]))
+        assert s["shape"] == "%dx%d" % (w, h), "the shape is not remembered"
+
+
+def test_the_four_states_are_four_different_pictures():
+    """⛔ THE DEFECT THIS FILE EXISTS FOR. Waiting, no tab, stopped and failed
+    are four different facts, and a pane that draws them the same way is a pane
+    that says nothing four times. The one that matters most is `error`: it
+    carries the server's own sentence, on the screen, where the version before
+    this one put it in a `title` attribute nobody hovers.
+
+    Known-bad: make `setState` hide the veil for anything but `live`, or drop
+    the detail line and leave the reason unsaid.
+    """
+    got = run("""
+      const out = {};
+      for(const [state, title, detail] of [['live','',''],
+                                           ['waiting','waiting for the first frame',''],
+                                           ['nopage','no tab open','ask the agent to open a page here'],
+                                           ['error','the capture failed','no frame within 5s'],
+                                           ['stale','','']]){
+        const cell = el('div','screen');
+        const box = el('div','frame'); box.appendChild(el('div','veil'));
+        cell.appendChild(box);
+        setState(cell, state, title, detail);
+        const veil = cell.querySelector('.veil');
+        out[state] = {state: cell.dataset.state, hidden: veil.hidden,
+                      text: veil.textContent,
+                      kids: veil.kids.map(k => k.className || k.tag)};
+      }
+      process.stdout.write(JSON.stringify(out));
+    """)
+    assert got["live"]["hidden"] is True, "a live screen still paints something over itself"
+    seen = {}
+    for name in ("waiting", "nopage", "error", "stale"):
+        assert got[name]["hidden"] is False, "%s draws nothing over the picture" % name
+        assert got[name]["state"] == name, "the state is not written on the cell"
+        seen[name] = got[name]["text"] + "|" + ",".join(got[name]["kids"])
+    assert len(set(seen.values())) == 4, (
+        "two states draw the same thing, which is the defect this test exists "
+        "for: %s" % seen)
+    assert "pulse" in got["waiting"]["kids"], (
+        "nothing says the pane is still trying, which is the only difference "
+        "between waiting and stopped")
+    assert "no frame within 5s" in got["error"]["text"], (
+        "the reason the capture failed is not on the screen")
+    assert got["stale"]["text"] == "", (
+        "the stale scrim writes over the last picture instead of dimming it - "
+        "that picture is the only evidence the pane has")
+
+
+def test_a_screen_says_how_old_its_picture_is():
+    """⛔ STALE HAS TO LOOK STALE. On a healthy stage every screen is refreshed
+    every 40 to 100 ms, so a picture older than a couple of seconds means that
+    browser has stopped answering - and the last frame is still sitting there
+    looking alive. A control room's first rule, and a dashboard's fifth state
+    after empty, loading, error and partial.
+
+    Known-bad, two: drop the stamp, or stop moving the cell into `stale` when
+    the number appears, which leaves a dimmed-looking pane with a red number
+    and no reason.
+    """
+    got = run("""
+      const mk = (agoMs) => { const cell = el('div','screen');
+        const box = el('div','frame');
+        box.appendChild(el('div','veil')); box.appendChild(el('span','stamp'));
+        cell.appendChild(box);
+        cell.dataset.state = 'live';
+        // The same clock the page reads: monotonic, not the wall.
+        cell.dataset.at = String(Math.round(performance.now()) - agoMs);
+        return cell; };
+      const fresh = mk(300), old = mk(4200);
+      ageAll([fresh, old]);
+      process.stdout.write(JSON.stringify({
+        fresh: {stamp: fresh.querySelector('.stamp').textContent,
+                hidden: fresh.querySelector('.stamp').hidden, state: fresh.dataset.state},
+        old: {stamp: old.querySelector('.stamp').textContent,
+              hidden: old.querySelector('.stamp').hidden, state: old.dataset.state}}));
+    """)
+    assert got["fresh"]["hidden"] is True and got["fresh"]["stamp"] == "", \
+        "a screen that just got a picture is stamped as old"
+    assert got["old"]["hidden"] is False and got["old"]["stamp"] == "4s", \
+        "a screen with a four second old picture says %r" % got["old"]["stamp"]
+    assert got["old"]["state"] == "stale", \
+        "the picture is stamped old but the screen still reads as live"
+
+
+def test_a_screen_is_built_as_a_frame_with_its_name_on_it():
+    """The name used to be a 28px bar bolted under the card, which put the
+    label of a thing outside the thing and cost a row of height in every cell
+    of a 2x2. It rides on the picture now, with the dot that says the agent is
+    working here beside it.
+
+    Known-bad: go back to a caption element outside the frame.
+    """
+    got = cells("""
+      const cell = screenFor({id: 'b-two', running: true, urls: ['http://x/']}, true);
+      const empty = screenFor({id: 'b-three', running: true, urls: []}, false);
+      process.stdout.write(JSON.stringify({one: tree(cell), none: tree(empty)}));
+    """)
+    frame = got["one"]["kids"][0]
+    assert frame["cls"] == "frame", "the screen no longer holds a frame"
+    inside = [k["cls"] or k["tag"] for k in frame["kids"]]
+    assert inside == ["img", "veil", "tag", "stamp"], \
+        "the frame holds %s" % inside
+    assert got["one"]["data"]["state"] == "waiting", \
+        "a screen with a page starts in %r" % got["one"]["data"]["state"]
+    assert got["none"]["data"]["state"] == "nopage" and got["none"]["data"]["blank"] == "1", \
+        "a browser with no tab is asked for a picture anyway"
+    tag = frame["kids"][2]
+    assert [k["cls"] for k in tag["kids"]] == ["id", "dot"], \
+        "the name on the picture lost the mark that says the agent is here"
+
+
+def test_an_empty_stage_says_what_to_do_about_being_empty():
+    """There is no button that opens a browser - they are opened by asking, on
+    purpose - so the empty stage is the one place that has to say so, and to
+    show the shape of the sentence that does it.
+
+    Known-bad: go back to naming the condition and stopping.
+    """
+    code = re.sub(r"/\*.*?\*/|<!--.*?-->", "", PAGE, flags=re.S)
+    # ⛔ AND IT IS THERE FROM THE FIRST PAINT, which is what this used to miss by
+    # asserting that the SCRIPT built the cell. Built in the script, the right
+    # half of the window was a near-black rectangle under an armed toolbar until
+    # `/live/browsers` answered: one round trip for the default conversation and
+    # seconds for any other, because asking spawns a server process first. Half
+    # the product showed nothing at all exactly while a new user was deciding
+    # what this is. So it ships as markup, and the script CLONES it - one
+    # declaration, in the place that draws before any request.
+    stage = code[code.index('id="stage"'):]
+    stage = stage[:stage.index("</div>")]
+    assert 'class="empty"' in stage, (
+        "the empty state is built by the script again, so the stage is blank "
+        "until the first answer comes back: %r" % stage[:120])
+    assert "emptyCell.cloneNode(true)" in code, (
+        "nothing puts the empty state back after a browser closes")
+    assert "Ask in the chat and one opens here" in PAGE, \
+        "the empty stage no longer says how a browser gets opened"
+    # ⛔ AND IT NO LONGER CARRIES AN EXAMPLE OF ITS OWN. The stage taught
+    # `open a browser and go to example.com` while the hint beside it taught
+    # `Go to example.com and tell me the main heading`: two halves of one
+    # page, two different first instructions. The hint keeps the one example
+    # and the stage says how a browser gets opened, which is its own job.
+    stage = PAGE[PAGE.index('id="stage"'):]
+    assert "<code>" not in stage[:stage.index("</div>")], \
+        "the stage teaches a second first instruction beside the one in the hint"
+    assert PAGE.count("Ask in the chat and one opens here") == 1, (
+        "the sentence is written in two places, which is how one of them goes "
+        "stale")
+
+
+def test_a_screen_is_named_by_its_action_and_described_by_its_state():
+    """⛔ THE NAME WAS WHATEVER WAS INSIDE THE BUTTON. A screen, a thumbnail
+    and a chip took their accessible name from their contents, so a screen
+    reader heard the address, the tag and the veil's sentence run together,
+    and `title` - which is never the name - carried the one word that said
+    what pressing does. And "not running" was a 6px ring with no text
+    equivalent anywhere.
+
+    The name is the action, the state is the description, and the veil that
+    already says the state on screen is what describes the control.
+
+    Known-bad, two: drop the label and let the contents be the name again;
+    drop the description and leave the veil unheard.
+    """
+    got = cells("""
+      const cell = screenFor({id: 'b-two', running: true, urls: ['http://x/']}, true);
+      const veil = cell.querySelector('.veil');
+      process.stdout.write(JSON.stringify({label: cell.attrs['aria-label'],
+        title: cell.title, describedBy: cell.attrs['aria-describedby'],
+        veilId: veil ? veil.id : null}));
+    """)
+    assert got["label"] == "Watch b-two", (
+        "a screen takes its name from its contents, so it is announced as the "
+        "address and the veil's sentence run together: %r" % (got,))
+    assert got["describedBy"] and got["describedBy"] == got["veilId"], (
+        "the veil says the state on screen and nothing points the control at "
+        "it, so the state is unheard: %r" % (got,))
+
+
+
+def test_the_dot_marks_the_browser_the_agent_is_actually_working_in():
+    """⛔ THE ONE THING THIS DOT SAYS, AND UNTIL 0.55.0 IT COULD NOT SAY IT.
+    Its title reads `the agent is working here`, and it is drawn on the
+    browser named by `stage.focus`, which the server answered as the literal
+    `main` from the day the focus tools went with the eight-browser session.
+    So with the helper open the dot sat on `main` while the agent typed into
+    `support` - a false sentence on screen, in the one place a person looks to
+    find out where the work is happening.
+
+    The server half is `test_open_first.py`: the focus is the browser the last
+    command acted in. This is the half that draws it, and the two meet in the
+    field name.
+
+    Known-bad, two: drop the dot for the focused screen, and draw it on every
+    screen. Both are caught, because what is asserted is which screen has one
+    AND which does not.
+    """
+    got = cells("""
+      stage.focus = 'support';
+      const out = {};
+      for(const id of ['main', 'support']){
+        const cell = screenFor({id, urls: ['http://x/']}, false);
+        const dot = cell.querySelector('.dot');
+        out[id] = dot ? dot.title : null;
+      }
+      process.stdout.write(JSON.stringify(out));
+    """)
+    assert got["support"] == "the agent is working here", (
+        "the browser the agent is working in carries no mark: %r" % (got,))
+    assert got["main"] is None, (
+        "a browser the agent is not working in is marked as though it were: "
+        "%r" % (got,))
