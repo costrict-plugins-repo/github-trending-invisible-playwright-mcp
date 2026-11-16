@@ -1,0 +1,1296 @@
+"""The agent loop in invisible_playwright_mcp/agent.py, driven by a scripted model.
+
+There is no OpenRouter key on this machine, so the model is replaced by a stub.
+Everything else is real: the objects handed to the loop are the same classes the
+production code would receive.
+
+REAL SHAPES COPIED, AND WHERE THEY WERE READ
+
+  mcp.types.Tool, ListToolsResult, CallToolResult, TextContent, ImageContent
+      Built here as the genuine pydantic models from `mcp` 1.29.1, not as
+      look-alikes, so a field the loop reads cannot exist here and be missing in
+      production. Field lists read from `mcp.types` model_fields:
+        Tool             name(req) title description inputSchema(req) outputSchema
+                         icons annotations meta execution
+        CallToolResult   meta content(req) structuredContent isError
+        TextContent      type='text' text(req) annotations meta
+        ImageContent     type='image' data mimeType annotations meta
+      Note that `inputSchema` is REQUIRED on a real Tool, so the "tool with no
+      inputSchema" case can only arrive as a duck-typed object or as an empty
+      dict; both are covered.
+
+  openai.types.chat.ChatCompletion / Choice / ChatCompletionMessage /
+  ChatCompletionMessageFunctionToolCall / Function
+      Also the genuine pydantic models from `openai` 3.7.0. This matters more
+      than it looks: the loop calls `msg.model_dump()` and replays the result to
+      the model, so the exact dict a real message produces is part of the
+      contract under test. A hand-written stub with a hand-written model_dump
+      would have tested the stub.
+
+  The scripted client mirrors the surface `llm.make_client` returns, which is
+  `openai.OpenAI`: the loop only ever touches `client.chat.completions.create`.
+
+  The scripted MCP session mirrors `mcp.ClientSession` as `Link` uses
+  it: `await mcp.list_tools()` returning a ListToolsResult, and
+  `await mcp.call_tool(name, args)` returning a CallToolResult.
+
+  Tool names and schemas are the real ones, taken from the server itself
+  (browser_navigate, browser_read_text, browser_snapshot, browser_read_html,
+  browser_take_screenshot, browser_click, browser_click_at, browser_type,
+  browser_press_key, browser_evaluate).
+
+No test in this file starts a browser or spawns the MCP server.
+"""
+from __future__ import annotations
+
+import ast
+import asyncio
+import copy
+import inspect
+import json
+import pathlib
+import time
+
+
+import mcp.types as mt
+from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_message_function_tool_call import (
+    ChatCompletionMessageFunctionToolCall,
+    Function,
+)
+
+from invisible_playwright_mcp import agent as agent_module
+from invisible_playwright_mcp.agent import (
+    system_message,
+    SYSTEM_PROMPT,
+    Conversation,
+    mcp_tools_to_openai,
+)
+from invisible_playwright_mcp.link import answer_of
+from _loop import run_task
+
+
+# --------------------------------------------------------------------------
+# real-shaped builders
+# --------------------------------------------------------------------------
+
+# The genuine inputSchema FastMCP derives from `browser_navigate(url: str,
+# wait_until: str = "domcontentloaded")`, in the shape the loop forwards.
+NAVIGATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "title": "Url"},
+        "wait_until": {
+            "type": "string",
+            "title": "Wait Until",
+            "default": "domcontentloaded",
+        },
+    },
+    "required": ["url"],
+}
+
+
+def tool(name: str, description: str | None = "d", schema: dict | None = None) -> mt.Tool:
+    """A real mcp.types.Tool. `inputSchema` is required by the model, so pass {}
+    for the "server declared nothing" case."""
+    return mt.Tool(
+        name=name,
+        description=description,
+        inputSchema=NAVIGATE_SCHEMA if schema is None else schema,
+    )
+
+
+def tools_result(*tools: mt.Tool) -> mt.ListToolsResult:
+    return mt.ListToolsResult(tools=list(tools))
+
+
+def text_result(text: str) -> mt.CallToolResult:
+    return mt.CallToolResult(content=[mt.TextContent(type="text", text=text)])
+
+
+def assistant_tool_calls(*calls: tuple[str, str, str]) -> ChatCompletionMessage:
+    """A real assistant message asking for tools. Each call is (id, name, arguments)."""
+    return ChatCompletionMessage(
+        role="assistant",
+        content=None,
+        tool_calls=[
+            ChatCompletionMessageFunctionToolCall(
+                id=cid, type="function", function=Function(name=name, arguments=args)
+            )
+            for cid, name, args in calls
+        ],
+    )
+
+
+def assistant_answer(text: str | None) -> ChatCompletionMessage:
+    """A real assistant message with no tool calls: the loop's stop condition."""
+    return ChatCompletionMessage(role="assistant", content=text, tool_calls=None)
+
+
+class ScriptedModel:
+    """Stands in for the `openai.OpenAI` client `llm.make_client` returns.
+
+    Only `chat.completions.create(**kwargs)` is exercised, which is all the loop
+    uses. Every request is recorded in `self.requests` so a test can assert what
+    the loop actually sent back, not merely what it returned.
+
+    The recording is a DEEP COPY on purpose. The loop mutates one `messages`
+    list in place across turns, so storing the argument by reference makes every
+    recorded request point at the final state: turn 1 then appears to have
+    carried the whole conversation, and any assertion about what was sent early
+    silently measures the end. That was observed here before the copy was added.
+    """
+
+    def __init__(self, replies, *, repeat_last: bool = False, usage=None):
+        # The response carries the token counts, not the client: the loop
+        # reads `resp.usage`, so a stand-in that keeps them anywhere else
+        # lets the accounting look untested while it is untouched.
+        self.usage = usage
+        self.replies = list(replies)
+        self.repeat_last = repeat_last
+        self.requests: list[dict] = []
+        self.chat = _Chat(self)
+
+    def _create(self, kwargs: dict) -> ChatCompletion:
+        self.requests.append(copy.deepcopy(kwargs))
+        i = len(self.requests) - 1
+        if i >= len(self.replies):
+            if not self.repeat_last:
+                raise AssertionError(
+                    f"the loop asked the model {i + 1} times, the script has "
+                    f"{len(self.replies)} replies"
+                )
+            i = len(self.replies) - 1
+        msg = self.replies[i]
+        return ChatCompletion(
+            id="chatcmpl-test",
+            usage=self.usage,
+            created=0,
+            model=kwargs.get("model", "stub"),
+            object="chat.completion",
+            choices=[
+                Choice(
+                    index=0,
+                    finish_reason="tool_calls" if msg.tool_calls else "stop",
+                    message=msg,
+                )
+            ],
+        )
+
+
+class _Chat:
+    def __init__(self, owner: ScriptedModel):
+        self.completions = _Completions(owner)
+
+
+class _Completions:
+    def __init__(self, owner: ScriptedModel):
+        self._owner = owner
+
+    def create(self, **kwargs) -> ChatCompletion:
+        return self._owner._create(kwargs)
+
+
+class ScriptedMCP:
+    """Stands in for `mcp.ClientSession` after `initialize()`.
+
+    `results` maps a tool name to what calling it returns; anything not named
+    returns a short text result. Every call is recorded in order.
+    """
+
+    def __init__(self, tools=None, results=None, *, raises: Exception | None = None):
+        self._tools = tools if tools is not None else tools_result(tool("browser_navigate"))
+        self._results = results or {}
+        self._raises = raises
+        self.calls: list[tuple[str, dict]] = []
+        self.list_tools_count = 0
+
+    async def list_tools(self) -> mt.ListToolsResult:
+        self.list_tools_count += 1
+        return self._tools
+
+    async def call_tool(self, name, arguments=None) -> mt.CallToolResult:
+        self.calls.append((name, arguments))
+        if self._raises is not None:
+            raise self._raises
+        return self._results.get(name, text_result(f"result of {name}"))
+
+
+def messages_of(request: dict) -> list[dict]:
+    return request["messages"]
+
+
+def tool_messages(request: dict) -> list[dict]:
+    return [m for m in request["messages"] if m.get("role") == "tool"]
+
+
+# --------------------------------------------------------------------------
+# mcp_tools_to_openai: the tool definitions handed to the model
+# --------------------------------------------------------------------------
+
+def test_definition_carries_exactly_the_three_fields_openai_requires():
+    """Known-bad: emitting the MCP tool dict straight through, or naming the
+    schema field `input_schema`. The OpenAI function-tool object is
+    {"type": "function", "function": {name, description, parameters}} and an
+    unexpected key at either level is rejected by the API."""
+    defs = mcp_tools_to_openai(tools_result(tool("browser_navigate", "Go to a url.")).tools)
+
+    assert len(defs) == 1
+    assert set(defs[0]) == {"type", "function"}
+    assert defs[0]["type"] == "function"
+    fn = defs[0]["function"]
+    assert set(fn) == {"name", "description", "parameters"}
+    assert fn["name"] == "browser_navigate"
+    assert fn["description"] == "Go to a url."
+    assert fn["parameters"] == NAVIGATE_SCHEMA
+
+
+def test_every_real_tool_name_survives_in_order():
+    """Known-bad: a dict keyed by name (order lost, duplicates collapsed) or a
+    filter that drops the session_* half. The model can only call what appears
+    in this list."""
+    names = [
+        "browser_open", "browser_close", "browser_list",
+        "browser_status", "browser_navigate", "browser_read_text",
+        "browser_snapshot", "browser_read_html", "browser_take_screenshot",
+        "browser_click", "browser_click_at", "browser_type",
+        "browser_press_key", "browser_evaluate",
+    ]
+    defs = mcp_tools_to_openai(tools_result(*[tool(n) for n in names]).tools)
+    assert [d["function"]["name"] for d in defs] == names
+
+
+def test_a_tool_with_no_description_becomes_an_empty_string_not_none():
+    """`description` is optional on mcp.types.Tool and arrives as None.
+
+    Known-bad: passing the None straight through. The measured behaviour is the
+    empty string, and this test fails if the field goes missing too."""
+    defs = mcp_tools_to_openai(tools_result(tool("browser_snapshot", None)).tools)
+    fn = defs[0]["function"]
+    assert "description" in fn
+    assert fn["description"] == ""
+    assert fn["description"] is not None
+
+
+def test_a_description_longer_than_1024_characters_is_truncated_to_1024():
+    """OpenAI caps a function description at 1024 characters and this is not
+    hypothetical: the real `browser_click_at` docstring measures 1124 characters
+    today, so one of the shipped tools is truncated on every run.
+
+    Known-bad: dropping the [:1024] slice, which makes the API reject the whole
+    request, or truncating to a different length."""
+    long_desc = "x" * 1030 + "TAIL-THAT-MUST-BE-CUT"
+    defs = mcp_tools_to_openai(tools_result(tool("browser_click_at", long_desc)).tools)
+
+    got = defs[0]["function"]["description"]
+    assert len(got) == 1024
+    assert got == long_desc[:1024]
+    assert "TAIL-THAT-MUST-BE-CUT" not in got
+
+
+def test_a_description_of_exactly_1024_characters_is_kept_whole():
+    """The boundary, asserted from the other side.
+
+    Known-bad: [:1023], or a `> 1024` guard that lops a character off every
+    description at the limit. The previous test alone cannot see that."""
+    desc = "y" * 1023 + "Z"
+    assert len(desc) == 1024
+    defs = mcp_tools_to_openai(tools_result(tool("browser_snapshot", desc)).tools)
+    got = defs[0]["function"]["description"]
+    assert len(got) == 1024
+    assert got.endswith("Z")
+
+
+def test_a_short_description_is_not_padded_or_rewritten():
+    defs = mcp_tools_to_openai(tools_result(tool("browser_read_text", "The visible text.")).tools)
+    assert defs[0]["function"]["description"] == "The visible text."
+
+
+def test_a_tool_with_no_input_schema_gets_a_valid_empty_object_schema():
+    """A None `parameters` is rejected by the OpenAI API, so the fallback has to
+    be a real JSON-Schema object.
+
+    Two arrivals are covered: a duck-typed tool object with no `inputSchema`
+    attribute at all, and a real Tool whose schema is the empty dict (the model
+    makes the field required, so {} is what an argument-free tool can look like).
+
+    Known-bad: `getattr(t, "inputSchema", None)` alone, which yields None for the
+    first case and {} for the second, both of which the API refuses."""
+    class _NoSchemaTool:
+        name = "browser_list"
+        description = "Every open tab."
+
+    defs = mcp_tools_to_openai([_NoSchemaTool(), tool("browser_close", "Close a browser.", {})])
+
+    for d in defs:
+        params = d["function"]["parameters"]
+        assert params is not None
+        assert isinstance(params, dict)
+        assert params.get("type") == "object"
+        assert params.get("properties") == {}
+        assert params == {"type": "object", "properties": {}}
+
+
+def test_the_fallback_schema_is_a_fresh_object_for_each_tool():
+    """Known-bad: hoisting the default to a module-level constant, which makes
+    every argument-free tool share one dict; a later caller that annotates or
+    mutates one definition would silently edit all the others."""
+    class _NoSchemaTool:
+        def __init__(self, name):
+            self.name = name
+            self.description = ""
+
+    defs = mcp_tools_to_openai([_NoSchemaTool("a"), _NoSchemaTool("b")])
+    first = defs[0]["function"]["parameters"]
+    second = defs[1]["function"]["parameters"]
+    assert first == second
+    assert first is not second
+
+    first["properties"]["injected"] = {"type": "string"}
+    assert second["properties"] == {}
+
+
+def test_a_declared_schema_is_forwarded_unchanged_including_required():
+    """Known-bad: rebuilding the schema and losing `required`, after which the
+    model may omit `url` and browser_navigate is called with nothing to open."""
+    defs = mcp_tools_to_openai(tools_result(tool("browser_navigate")).tools)
+    params = defs[0]["function"]["parameters"]
+    assert params["required"] == ["url"]
+    assert params["properties"]["wait_until"]["default"] == "domcontentloaded"
+
+
+def test_the_definitions_are_json_serialisable():
+    """They are about to be sent over the wire, so a pydantic object left inside
+    would fail at request time rather than here.
+
+    Known-bad: forwarding `t.inputSchema` as a model instead of a dict."""
+    defs = mcp_tools_to_openai(tools_result(tool("browser_type"), tool("browser_click")).tools)
+    assert json.loads(json.dumps(defs)) == defs
+
+
+def test_no_tools_produces_an_empty_list():
+    """Pinned as a fact, not as an endorsement: OpenAI rejects `tools: []`, so a
+    server that exposed nothing would fail at the first request rather than here.
+    See the report."""
+    assert mcp_tools_to_openai(tools_result().tools) == []
+
+
+# --------------------------------------------------------------------------
+# answer_of: what the browser sends back to the model
+# --------------------------------------------------------------------------
+
+def test_answer_of_returns_the_text_of_a_text_content():
+    assert answer_of(text_result("hello-from-the-page"))[0] == "hello-from-the-page"
+
+
+def test_answer_of_is_empty_for_empty_or_missing_content():
+    """Known-bad: indexing content[0] unguarded, which raises IndexError and
+    kills the run on a tool that legitimately returns nothing."""
+    assert answer_of(mt.CallToolResult(content=[]))[0] == ""
+
+    class _NoContent:
+        pass
+
+    assert answer_of(_NoContent())[0] == ""
+
+
+def test_answer_of_labels_a_non_text_content_instead_of_crashing():
+    """A real ImageContent has no `text` attribute at all. browser_take_screenshot
+    returns exactly that.
+
+    Known-bad: `first.text`, which raises AttributeError. The measured behaviour
+    is the placeholder, so the screenshot never reaches the model; that gap is in
+    the report."""
+    shot = mt.CallToolResult(
+        content=[mt.ImageContent(type="image", data="aGk=", mimeType="image/png")]
+    )
+    assert answer_of(shot)[0] == "[non-text result]"
+
+
+def test_answer_of_reads_only_the_first_content_block():
+    """Pins measured behaviour that is also a defect: a multi-block result loses
+    everything after the first block, silently.
+
+    Known-bad, in the sense of what would break this assertion: joining the
+    blocks. If someone does that deliberately this test should be updated, not
+    deleted, because the current wording is what the model actually sees."""
+    multi = mt.CallToolResult(
+        content=[
+            mt.TextContent(type="text", text="FIRST"),
+            mt.TextContent(type="text", text="SECOND"),
+        ]
+    )
+    assert answer_of(multi)[0] == "FIRST"
+    assert "SECOND" not in answer_of(multi)[0]
+
+
+def test_an_empty_text_block_is_reported_as_a_non_text_result():
+    """Also measured behaviour and also a defect: an empty string is falsy, so a
+    tool that correctly found nothing (an empty element read by
+    browser_read_text) is described to the model as a non-text result, which is
+    a different fact."""
+    assert answer_of(text_result(""))[0] == "[non-text result]"
+
+
+# --------------------------------------------------------------------------
+# the loop: stopping, ordering, ids, truncation, limits
+# --------------------------------------------------------------------------
+
+async def test_the_loop_stops_and_returns_the_text_when_the_model_answers():
+    """Known-bad: looping until max_turns regardless, which burns 25 requests
+    and then raises on a task that was already finished."""
+    mcp = ScriptedMCP()
+    model = ScriptedModel([assistant_answer("The heading is hello")])
+
+    out = await run_task(mcp, "read the page", client=model, model="z-ai/glm-4.6")
+
+    assert out == "The heading is hello"
+    assert mcp.calls == []
+    assert len(model.requests) == 1
+
+
+async def test_a_final_answer_with_no_content_returns_the_empty_string():
+    """A model can stop with content None. Known-bad: returning None, which the
+    CLI would print as the string "None"."""
+    out = await run_task(ScriptedMCP(), "t", client=ScriptedModel([assistant_answer(None)]), model="m")
+    assert out == ""
+    assert isinstance(out, str)
+
+
+async def test_the_first_request_carries_the_system_prompt_the_task_and_the_tools():
+    """Known-bad: dropping the system prompt (the model then has no instruction
+    to stop calling tools), sending the task as a system message, or forgetting
+    tool_choice, after which a model may answer from memory without ever opening
+    the browser."""
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate"), tool("browser_read_text")))
+    model = ScriptedModel([assistant_answer("done")])
+
+    await run_task(mcp, "open example and read it", client=model, model="z-ai/glm-4.6")
+
+    req = model.requests[0]
+    msgs = messages_of(req)
+    assert msgs[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert msgs[1] == {"role": "user", "content": "open example and read it"}
+    assert req["model"] == "z-ai/glm-4.6"
+    assert req["tool_choice"] == "auto"
+    assert req["temperature"] == 0
+    assert [d["function"]["name"] for d in req["tools"]] == [
+        "browser_navigate", "browser_read_text",
+    ]
+
+
+async def test_every_tool_call_in_one_message_runs_once_and_in_order():
+    """Known-bad: executing only tool_calls[0], which is what a model asking for
+    navigate + read_text in one message would silently lose."""
+    mcp = ScriptedMCP(
+        tools=tools_result(tool("browser_navigate"), tool("browser_type"), tool("browser_click"))
+    )
+    model = ScriptedModel([
+        assistant_tool_calls(
+            ("call_a", "browser_navigate", '{"url": "http://127.0.0.1:8000/form"}'),
+            ("call_b", "browser_type", '{"selector": "#name", "text": "ada"}'),
+            ("call_c", "browser_click", '{"selector": "#submit"}'),
+        ),
+        assistant_answer("submitted"),
+    ])
+
+    out = await run_task(mcp, "fill the form", client=model, model="m")
+
+    assert out == "submitted"
+    assert mcp.calls == [
+        ("browser_navigate", {"url": "http://127.0.0.1:8000/form"}),
+        ("browser_type", {"selector": "#name", "text": "ada"}),
+        ("browser_click", {"selector": "#submit"}),
+    ]
+
+
+async def test_each_tool_result_is_returned_under_its_own_tool_call_id():
+    """A mismatched or reused tool_call_id makes the next request fail, so the
+    pairing is the load-bearing part.
+
+    Known-bad: appending every result under msg.tool_calls[0].id, which passes a
+    naive "the id is present" check while pairing every result with the wrong
+    call."""
+    mcp = ScriptedMCP(
+        tools=tools_result(tool("browser_navigate"), tool("browser_read_text")),
+        results={
+            "browser_navigate": text_result("NAVIGATED"),
+            "browser_read_text": text_result("PAGE-BODY"),
+        },
+    )
+    model = ScriptedModel([
+        assistant_tool_calls(
+            ("call_nav", "browser_navigate", '{"url": "http://127.0.0.1"}'),
+            ("call_read", "browser_read_text", '{"selector": "body"}'),
+        ),
+        assistant_answer("read it"),
+    ])
+
+    await run_task(mcp, "read", client=model, model="m")
+
+    second = model.requests[1]
+    results = tool_messages(second)
+    assert [m["tool_call_id"] for m in results] == ["call_nav", "call_read"]
+    assert [m["content"] for m in results] == ["NAVIGATED", "PAGE-BODY"]
+    for m in results:
+        assert m["role"] == "tool"
+        assert set(m) >= {"role", "tool_call_id", "content"}
+
+
+async def test_the_assistant_message_is_replayed_before_its_tool_results():
+    """OpenAI refuses a tool message whose assistant message with the matching
+    tool_calls is not already in the history.
+
+    Known-bad: appending only the tool results and dropping msg.model_dump(),
+    which produces "messages with role tool must be a response to a preceding
+    message with tool_calls"."""
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate")))
+    model = ScriptedModel([
+        assistant_tool_calls(("call_1", "browser_navigate", '{"url": "http://127.0.0.1"}')),
+        assistant_answer("ok"),
+    ])
+
+    await run_task(mcp, "go", client=model, model="m")
+
+    msgs = messages_of(model.requests[1])
+    roles = [m["role"] for m in msgs]
+    assert roles == ["system", "user", "assistant", "tool"]
+
+    replayed = msgs[2]
+    assert replayed["tool_calls"][0]["id"] == "call_1"
+    assert replayed["tool_calls"][0]["function"]["name"] == "browser_navigate"
+    assert msgs[3]["tool_call_id"] == "call_1"
+
+
+async def test_the_whole_history_grows_and_is_resent_every_turn():
+    """Known-bad: rebuilding `messages` per turn, or sending only the last
+    exchange, after which the model forgets the task after the first tool call."""
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate"), tool("browser_read_text")))
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_navigate", '{"url": "http://127.0.0.1"}')),
+        assistant_tool_calls(("c2", "browser_read_text", '{"selector": "body"}')),
+        assistant_answer("done"),
+    ])
+
+    await run_task(mcp, "the original task", client=model, model="m")
+
+    lengths = [len(messages_of(r)) for r in model.requests]
+    assert lengths == [2, 4, 6]
+    for r in model.requests:
+        assert messages_of(r)[1] == {"role": "user", "content": "the original task"}
+
+
+async def test_the_tool_definitions_are_listed_once_and_resent_unchanged():
+    """Known-bad: calling list_tools inside the turn loop, which pays an MCP
+    round trip per turn; or mutating tool_defs between turns, which makes the
+    model's tool names drift from the server's."""
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate"), tool("browser_read_text")))
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_navigate", '{"url": "http://127.0.0.1"}')),
+        assistant_tool_calls(("c2", "browser_read_text", "{}")),
+        assistant_answer("done"),
+    ])
+
+    await run_task(mcp, "t", client=model, model="m")
+
+    assert mcp.list_tools_count == 1
+    assert len(model.requests) == 3
+    first_tools = model.requests[0]["tools"]
+    for r in model.requests[1:]:
+        assert r["tools"] == first_tools
+
+
+async def test_a_tool_result_longer_than_8000_characters_is_truncated_to_8000():
+    """browser_read_text can return a whole page, and an untruncated result blows
+    the context window a few turns later.
+
+    The 8000th character is a marker, so an off-by-one (a [:7999] slice) fails
+    here rather than passing on the length alone."""
+    body = "a" * 7999 + "Z" + "b" * 1000
+    mcp = ScriptedMCP(
+        tools=tools_result(tool("browser_read_text")),
+        results={"browser_read_text": text_result(body)},
+    )
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_read_text", '{"selector": "body"}')),
+        assistant_answer("read"),
+    ])
+
+    await run_task(mcp, "read", client=model, model="m")
+
+    sent = tool_messages(model.requests[1])[0]["content"]
+    kept, _, said = sent.partition("\n[...")
+    assert len(kept) == 8000
+    assert kept.endswith("Z")
+    assert "b" not in kept
+    # ⛔ AND IT IS TOLD THAT THERE IS MORE. A model reading the first 8000
+    # characters of a page with no sign that it is the first 8000 answers about
+    # the whole page from a fragment. The count is in the sentence so it can
+    # decide whether to go and get the rest.
+    assert said.startswith(" 1000 more characters, not sent]"), (
+        "the cut is silent, so the model reads a fragment as the whole thing: "
+        "%r" % sent[-80:])
+
+
+async def test_a_result_at_or_below_the_limit_is_sent_whole():
+    """Known-bad: an unconditional slice that also truncates, or a guard that
+    trims short results. The exact-8000 case is the one a `> 8000` check gets
+    wrong."""
+    exact = "c" * 7999 + "E"
+    mcp = ScriptedMCP(
+        tools=tools_result(tool("browser_read_text")),
+        results={"browser_read_text": text_result(exact)},
+    )
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_read_text", "{}")),
+        assistant_answer("read"),
+    ])
+
+    await run_task(mcp, "read", client=model, model="m")
+
+    sent = tool_messages(model.requests[1])[0]["content"]
+    assert sent == exact
+    assert len(sent) == 8000
+
+
+async def test_a_long_task_runs_past_the_old_ceiling_and_still_returns():
+    """There is no turn ceiling, and this is the test that says so.
+
+    The loop used to stop at 25 and raise, which ended long tasks that were
+    going fine one step before they might have answered. This drives it well
+    past that number and expects the answer.
+
+    Known-bad: any `range(...)` back around the loop, or a re-added constant.
+    Either one makes this raise instead of returning, at whatever number it was
+    set to.
+    """
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate")))
+    steps = [assistant_tool_calls(("c%d" % i, "browser_navigate",
+                                   '{"url": "http://127.0.0.1"}'))
+             for i in range(40)]
+    model = ScriptedModel(steps + [assistant_answer("done after forty steps")])
+
+    out = await run_task(mcp, "a long one", client=model, model="m")
+
+    assert out == "done after forty steps"
+    assert len(model.requests) == 41
+    assert len(mcp.calls) == 40
+
+
+async def test_the_model_call_does_not_hold_the_event_loop():
+    """A blocking call on the loop turns the stop button into a decoration.
+
+    The model request is a SYNCHRONOUS HTTP call. Run directly on the event
+    loop it holds the whole server for its duration: `/chat/stop` cannot be
+    served, no event reaches the page, and the live browser pane freezes. With
+    no turn ceiling that repeats on every turn of an arbitrarily long run, and
+    the stop button is the only thing that ends such a run - so it has to be
+    answerable while the model is thinking, which is exactly when a person
+    reaches for it.
+
+    Measured rather than reasoned about: a heartbeat counts how many slices the
+    loop hands out while one model call is in flight. On the loop the answer is
+    zero.
+
+    Known-bad: `self.client.chat.completions.create(...)` called directly in
+    `run` instead of being handed to a thread. This test then counts 0 ticks.
+    """
+    blocking_seconds = 0.30
+    tick_seconds = 0.01
+
+    class BlockingModel(ScriptedModel):
+        """Stands in for a real request: it occupies the caller, not an await."""
+
+        def _create(self, kwargs: dict):
+            time.sleep(blocking_seconds)
+            return super()._create(kwargs)
+
+    mcp = ScriptedMCP()
+    model = BlockingModel([assistant_answer("done")])
+
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(tick_seconds)
+            ticks += 1
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        out = await run_task(mcp, "t", client=model, model="m")
+    finally:
+        beat.cancel()
+
+    assert out == "done"
+    assert ticks >= 5, (
+        "the loop got %d slices during a %.2fs model call, so the call is "
+        "running ON the event loop: while the model thinks, the stop route, "
+        "the event stream and the frame pump are all unreachable"
+        % (ticks, blocking_seconds))
+
+
+async def test_a_task_that_answers_on_its_second_turn_returns_there():
+    """The short case still works, which is the other half of removing a cap:
+    nothing about a run that finishes quickly changed.
+
+    Known-bad: a loop that keeps asking after the model stopped calling tools,
+    which would spend forever on a task that was already answered.
+    """
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate")))
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_navigate", '{"url": "http://127.0.0.1"}')),
+        assistant_answer("finished on turn two"),
+    ])
+
+    out = await run_task(mcp, "t", client=model, model="m")
+    assert out == "finished on turn two"
+
+
+def test_no_turn_budget_is_exposed_anywhere_in_the_loop():
+    """Structural pin: the parameter is gone, not defaulted to something large.
+
+    Known-bad: `max_turns: int = 1000`, which reads as "no limit" to whoever
+    added it and is still a wall a long task can hit in front of a user.
+
+    Read from the AST and not from the text. The first version of this test
+    searched the source for the string and failed on the comment in agent.py
+    that quotes the error the ceiling used to raise - a check tripped by the
+    prose explaining the code rather than by the code, which is the defect this
+    project writes down most often.
+    """
+    assert "max_turns" not in inspect.signature(run_task).parameters
+    assert "max_turns" not in inspect.signature(Conversation.__init__).parameters
+
+    tree = ast.parse(pathlib.Path(agent_module.__file__).read_text(encoding="utf-8"))
+    named = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg):
+            named.add(node.arg)
+        elif isinstance(node, ast.Attribute):
+            named.add(node.attr)
+        elif isinstance(node, ast.Name):
+            named.add(node.id)
+        elif isinstance(node, ast.keyword) and node.arg:
+            named.add(node.arg)
+    assert "max_turns" not in named
+
+
+async def test_empty_tool_arguments_become_an_empty_dict():
+    """Models emit `arguments: ""` for a tool that takes nothing.
+
+    Known-bad: `json.loads(call.function.arguments)`, which raises
+    JSONDecodeError on the empty string and kills the run on the most ordinary
+    call there is."""
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_list", "browsers", {})))
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_list", "")),
+        assistant_answer("listed"),
+    ])
+
+    await run_task(mcp, "list the tabs", client=model, model="m")
+
+    assert mcp.calls == [("browser_list", {})]
+
+
+async def test_arguments_are_parsed_from_json_not_forwarded_as_a_string():
+    """Known-bad: passing call.function.arguments through untouched, after which
+    the MCP server receives a string where it expects a mapping."""
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_click_at")))
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_click_at", '{"x": 120, "y": 44.5, "ok": true}')),
+        assistant_answer("clicked"),
+    ])
+
+    await run_task(mcp, "click", client=model, model="m")
+
+    name, args = mcp.calls[0]
+    assert isinstance(args, dict)
+    assert args == {"x": 120, "y": 44.5, "ok": True}
+
+
+async def test_malformed_tool_arguments_are_reported_back_and_the_run_continues():
+    """Updated on purpose, exactly as the version before it asked to be.
+
+    It used to pin the opposite - truncated JSON raising out of run_task - and
+    said so while calling it a defect: a task twenty turns in lost everything
+    because one message came back malformed, which happens routinely at length.
+    The model is told instead, and gets to try again.
+
+    The tool is NOT called with the broken arguments, which is the half that
+    would be dangerous to lose: recovering must not mean guessing what was meant.
+    """
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate")))
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_navigate", '{"url": "http://127.0.0.1"')),
+        assistant_answer("recovered"),
+    ])
+
+    answer = await run_task(mcp, "go", client=model, model="m")
+
+    assert answer == "recovered"
+    assert mcp.calls == [], "the tool must not run with arguments that did not parse"
+    assert len(model.requests) == 2, "the model was asked again after being told"
+    fed_back = [m for m in model.requests[-1]["messages"] if m.get("role") == "tool"]
+    assert fed_back and "JSON" in fed_back[-1]["content"]
+    assert fed_back[-1]["tool_call_id"] == "c1"
+
+
+async def test_a_failing_tool_is_reported_back_instead_of_ending_the_run():
+    """Same family, from the browser side, and updated for the same reason.
+
+    A timeout, a closed page, a refused connection: on a real site these are the
+    normal texture of a task, not the end of one. The model sees the error as the
+    tool's result and can try another way - which is the only thing that makes a
+    twenty-step task on a page nobody controls survivable.
+
+    What it must NOT do is swallow it: the text of the failure reaches the model
+    intact, so it can tell a bad selector from a dead host.
+    """
+    boom = RuntimeError("Page.goto: net::ERR_CONNECTION_REFUSED")
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate")), raises=boom)
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_navigate", '{"url": "http://127.0.0.1:1"}')),
+        assistant_answer("could not reach it"),
+    ])
+
+    answer = await run_task(mcp, "go", client=model, model="m")
+
+    assert answer == "could not reach it"
+    assert len(model.requests) == 2
+    fed_back = [m for m in model.requests[-1]["messages"] if m.get("role") == "tool"]
+    assert fed_back and "ERR_CONNECTION_REFUSED" in fed_back[-1]["content"]
+
+
+async def test_an_error_flagged_result_is_still_fed_back_as_text():
+    """isError is not read, so the model gets the message body with nothing
+    marking it as a failure. Pinned because it decides what the model believes:
+    the text has to survive even when the call failed, otherwise the model
+    retries blind."""
+    failed = mt.CallToolResult(
+        content=[mt.TextContent(type="text", text="selector #missing not found")],
+        isError=True,
+    )
+    mcp = ScriptedMCP(
+        tools=tools_result(tool("browser_click")),
+        results={"browser_click": failed},
+    )
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_click", '{"selector": "#missing"}')),
+        assistant_answer("could not click"),
+    ])
+
+    out = await run_task(mcp, "click", client=model, model="m")
+
+    assert out == "could not click"
+    assert tool_messages(model.requests[1])[0]["content"] == "selector #missing not found"
+
+
+async def test_a_tool_that_answers_with_an_error_is_narrated_as_an_error():
+    """⛔ MCP REPORTS A FAILED TOOL AS A RESULT, NOT AS AN EXCEPTION, and the
+    loop read the text and threw the flag away. Every failure then reached the
+    page as `result`, which the step row draws in the past tense that asserts the
+    thing happened: `Navigated https://...` in the colour of an ordinary answer,
+    with `NS_ERROR_UNKNOWN_HOST` printed after it. Measured on a live session, no
+    row had ever reached the error state the page has always known how to draw.
+
+    For an agent that acts on real websites this is worse than a gap in the log:
+    it is a lie, and it costs the reader the ability to trust any other row.
+
+    Known-bad: go back to `say("result", ...)` for every answer that does not
+    raise.
+    """
+    bad = mt.CallToolResult(
+        content=[mt.TextContent(type="text", text="Page.goto: NS_ERROR_UNKNOWN_HOST")],
+        isError=True,
+    )
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate", "Go to a url.")),
+                      results={"browser_navigate": bad})
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_navigate",
+                              '{"url": "https://nope.invalid"}')),
+        assistant_answer("that host does not resolve"),
+    ])
+    said = []
+
+    async def watch(kind, text):
+        said.append((kind, text))
+
+    convo = Conversation(model, "m")
+    out = await convo.run("go to nope.invalid", mcp.call_tool,
+                          (await mcp.list_tools()).tools, say=watch)
+
+    assert out == "that host does not resolve"
+    kinds = [k for k, _ in said]
+    assert "err" in kinds, "a failed tool was narrated as %s" % kinds
+    assert "result" not in kinds, "the failure was also announced as a result"
+    assert any("NS_ERROR_UNKNOWN_HOST" in text for k, text in said if k == "err"), (
+        "the error row does not carry the reason the tool gave")
+    # And the model still sees it, or it cannot recover from what it cannot read.
+    assert "NS_ERROR_UNKNOWN_HOST" in tool_messages(model.requests[1])[0]["content"]
+
+
+async def test_a_screenshot_reaches_the_model_as_a_placeholder_only():
+    """End to end through the loop, not just through said: the model asks
+    for browser_take_screenshot, which is one of the advertised tools, and the
+    only thing that comes back is "[non-text result]". The image is dropped."""
+    shot = mt.CallToolResult(
+        content=[mt.ImageContent(type="image", data="aGk=", mimeType="image/png")]
+    )
+    mcp = ScriptedMCP(
+        tools=tools_result(tool("browser_take_screenshot", "One screenshot.", {})),
+        results={"browser_take_screenshot": shot},
+    )
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "browser_take_screenshot", "{}")),
+        assistant_answer("I cannot see the image"),
+    ])
+
+    await run_task(mcp, "look at the page", client=model, model="m")
+
+    sent = tool_messages(model.requests[1])[0]["content"]
+    assert sent == "[non-text result]"
+    assert "aGk=" not in sent
+
+
+async def test_two_calls_to_the_same_tool_keep_distinct_ids_and_results():
+    """Known-bad: keying results by tool name, which collapses a repeated
+    browser_read_text into one message and breaks the id pairing."""
+    seen = []
+
+    class _Alternating(ScriptedMCP):
+        async def call_tool(self, name, arguments=None):
+            self.calls.append((name, arguments))
+            seen.append(arguments)
+            return text_result(f"read #{len(seen)}")
+
+    mcp = _Alternating(tools=tools_result(tool("browser_read_text")))
+    model = ScriptedModel([
+        assistant_tool_calls(
+            ("c1", "browser_read_text", '{"selector": "h1"}'),
+            ("c2", "browser_read_text", '{"selector": "p"}'),
+        ),
+        assistant_answer("both read"),
+    ])
+
+    await run_task(mcp, "read twice", client=model, model="m")
+
+    results = tool_messages(model.requests[1])
+    assert [m["tool_call_id"] for m in results] == ["c1", "c2"]
+    assert [m["content"] for m in results] == ["read #1", "read #2"]
+
+
+async def test_the_turn_is_counted_even_though_nothing_announces_it():
+    """⛔ THE MEASURING OUTLIVED THE METER, AND THAT IS THE RISKY HALF. The
+    page drew these numbers in a header meter and no longer does, so the `usage`
+    EVENT went with it. The counting stayed, because it is what the transcript
+    is saved with and what any number put back anywhere would read - and an
+    accounting nobody watches is exactly the kind that stops working with
+    nothing going red.
+
+    Known-bad, two: drop `_note_usage` along with the event it used to feed,
+    and put the announcement back.
+    """
+    from openai.types import CompletionUsage
+
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate")))
+    model = ScriptedModel([assistant_answer("done")],
+                          usage=CompletionUsage(prompt_tokens=120,
+                                               completion_tokens=8,
+                                               total_tokens=128))
+    said = []
+
+    async def watch(kind, text):
+        said.append((kind, text))
+
+    convo = Conversation(model, "m")
+    await convo.run("open it", mcp.call_tool,
+                    (await mcp.list_tools()).tools, say=watch)
+
+    assert convo.usage["calls"] == 1, (
+        "the turn was not counted: %r" % convo.usage)
+    assert convo.usage["prompt"] == 120 and convo.usage["completion"] == 8
+    assert convo.usage["last_prompt"] == 120, (
+        "the last turn's prompt is what occupancy is read from")
+    assert "usage" not in [k for k, _ in said], (
+        "the numbers are announced again, and nothing on the page draws them - "
+        "an event with no case is written into the transcript as raw JSON")
+
+def test_the_answer_is_asked_for_the_way_a_person_would_write_it():
+    """⛔ THE WRITING COMES FROM THE MODEL, SO THE FIX IS THE PROMPT. A renderer
+    that stripped the decoration would be a filter over a habit instead of an
+    instruction against it.
+
+    The rest of the shape came from a measurement worth keeping: against the
+    model this product runs, on eight finished tasks with the answer asked for
+    three ways, the arm carrying no instruction at all produced 19 bold labels,
+    8 numbered checklists, 7 em dashes, 2 openings that announce what is coming
+    and 2 closings that summarise what was just said. The same eight tasks with
+    the sentences below: 3 bold, 0 checklists, 0 em dashes, 0 preambles, 0
+    restatements. Those sentences stay exactly as they are.
+
+    ⛔ THE EMOJI RULE IS FLAT NOW, AND IT IS FLAT BECAUSE THE CONDITIONAL ONE WAS
+    READ AS PERMISSION. It said an emoji "is fine where it carries something the
+    words do not, and wrong as a status marker at the head of every line" - and
+    what came back was a tick at the head of every line, the one thing that
+    sentence named. That is what a rule with an exception in it buys: the model
+    satisfies it by finding the exception.
+
+    The same eight-task measurement had also found only ONE emoji in eight with
+    no instruction at all, and that number is why the earlier wording went soft.
+    It was a measurement of eight short tasks, not of a real session, and a real
+    session settled it: the owner read one and asked for no emoji, full stop
+    (2026-09-09). Eight tasks is not the product being used. Do not soften this
+    again on the strength of that number.
+
+    ⛔ AND IT ASSERTED THE WORD `markdown`, WHERE THE REQUIREMENT IS A MEANING.
+    The prompt now names the marks it allows - a heading, a list, a table -
+    which says the same thing to a model and says it more precisely, and the old
+    assertion went red on the better prompt. A gate that checks a word instead
+    of what the word stood for is the comment-versus-code defect, moved into a
+    string.
+
+    Known-bad, five: drop the sentence about decoration; drop the marks it
+    names; ask for "plain text" again; put an emoji or an em dash in the prompt
+    itself - one that decorates while asking for restraint teaches the habit it
+    is trying to curb - and put the exception back into the emoji sentence.
+    """
+    low = SYSTEM_PROMPT.lower()
+    assert "emoji" in low, (
+        "nothing says anything about decoration, and the recap of a long task "
+        "is exactly where a model reaches for a tick: %r" % SYSTEM_PROMPT)
+    # ⛔ THE WORD IS NOT THE RULE. This asserted `emoji` alone, and the sentence
+    # that licensed emoji satisfied it perfectly - the same comment-versus-code
+    # defect the paragraph above names for `markdown`, committed by the very
+    # gate that names it. What has to be true is that the prompt FORBIDS them.
+    said = next(s for s in SYSTEM_PROMPT.split(". ") if "emoji" in s.lower())
+    assert any(no in said.lower() for no in ("never", "do not", "don't", "no ")), (
+        "the prompt mentions emoji without forbidding them: %r" % said)
+    for loophole in ("is fine", "are fine", "where it", "unless", "except",
+                     "may use", "can use", "sometimes", "sparingly", "rare"):
+        assert loophole not in said.lower(), (
+            "the emoji rule carries an exception (%r), and an exception is what "
+            "a model reaches for: %r" % (loophole, said))
+    named = [mark for mark in ("heading", "list", "table") if mark in low]
+    assert len(named) == 3, (
+        "the pane draws these and the prompt names %s, so the model is guessing "
+        "which of them it may use" % (named or "none of them"))
+    assert "plain text" not in low, (
+        "asking for plain text and for a table in the same breath is two "
+        "instructions that disagree")
+    for tell in ("the answer first", "say it once"):
+        assert tell in low, (
+            "the prompt no longer asks for the shape that was measured: %r" % tell)
+    decorative = [c for c in SYSTEM_PROMPT
+                  if ord(c) > 0x2100 or c in "✅❌⛔—–"]
+    assert not decorative, (
+        "the prompt asks for restraint while using %r" % decorative)
+def test_a_reopened_conversation_gets_THIS_build_instructions():
+    """⛔ A SAVED TRANSCRIPT CARRIES THE PROMPT OF THE DAY IT STARTED, and
+    restoring it wholesale let the file win against the code.
+
+    Found while adding the sentence that tells the model not to decorate answers
+    with ticks and crosses: the change would have reached new conversations
+    only, and every one anybody already had open would have kept doing it
+    forever, with nothing anywhere saying why. The transcript is what was SAID;
+    the instructions are what this build asks for, and there is exactly one
+    place they live.
+
+    Known-bad: `self._convo.messages = list(messages)`, which is what it did.
+    """
+    from invisible_playwright_mcp.agent import OpenRouterBrain
+
+    brain = OpenRouterBrain(client=object(), model="m")
+    brain.remember([
+        {"role": "system", "content": "an old instruction, with emoji please"},
+        {"role": "user", "content": "open the listings"},
+        {"role": "assistant", "content": "three roles"},
+    ])
+
+    system = [m for m in brain.messages if m["role"] == "system"]
+    assert len(system) == 1, "a restored transcript must not stack up prompts"
+    assert system[0]["content"] == SYSTEM_PROMPT, (
+        "the conversation came back under the instructions saved in the file, "
+        "so changing the prompt reaches new conversations only")
+    assert brain.messages[0]["role"] == "system", "the prompt has to lead"
+    assert [m["content"] for m in brain.messages[1:]] == [
+        "open the listings", "three roles"], "the transcript itself was altered"
+
+
+async def test_the_server_instructions_reach_the_model():
+    """⛔ THE SERVER'S INSTRUCTIONS WENT NOWHERE. They are the one place the
+    two-browser contract is written - what `support` is for, and that whoever
+    opens it closes it - and the loop sent the system prompt and the tool
+    descriptions and nothing else. Measured 2026-09-12: six runs of a task that
+    needs both browsers, `support` left open in six.
+
+    They travel with the link and are put into the system message at the start
+    of every run, by the one function that builds it, so a transcript restored
+    from disk and a fresh one carry the same current instructions.
+
+    Known-bad, three: drop the argument; build the system message in the
+    constructor only, so a restored transcript keeps the old one; put the
+    instructions in a second system message instead of the one.
+    """
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_open")), results={})
+    model = ScriptedModel([assistant_answer("done"), assistant_answer("done")])
+    convo = Conversation(model, "m")
+    tools = (await mcp.list_tools()).tools
+    await convo.run("go", mcp.call_tool, tools, instructions="There are two browsers.")
+
+    system = [m for m in model.requests[0]["messages"] if m["role"] == "system"]
+    assert len(system) == 1, "the instructions travel as a second system message"
+    assert system[0]["content"].startswith(SYSTEM_PROMPT), "the prompt is no longer first"
+    assert system[0]["content"].endswith("There are two browsers."), (
+        "the server's instructions do not reach the model: %r" % system[0]["content"][-80:])
+    assert convo.messages[0] == system_message("There are two browsers.")
+
+    #: and a run with a different server replaces them rather than stacking
+    await convo.run("again", mcp.call_tool, tools, instructions="Only one browser.")
+    system = [m for m in model.requests[1]["messages"] if m["role"] == "system"]
+    assert len(system) == 1 and system[0]["content"].endswith("Only one browser."), (
+        "the instructions of a previous run are still in the message")
+
+
+def test_the_end_of_the_turn_closes_the_helper_before_the_answer():
+    """⛔ THE SENTENCE ABOUT ENDING FORBADE THE CALL THAT CLOSES `support`. It
+    said `reply with the answer and do NOT call any more tools`, which is the
+    moment the model was told to stop - so the close never came, in every run
+    measured and in the owner's own 247-step session. The order is in the
+    sentence now, and without loophole vocabulary: an exception is what a model
+    reaches for.
+
+    Known-bad: put the old sentence back, or phrase the close as an exception.
+    """
+    low = SYSTEM_PROMPT.lower()
+    ending = next(s for s in low.split(". ") if "task is done" in s)
+    assert "support" in ending and "browser_close" in ending, (
+        "the end-of-turn sentence does not say to close support: %r" % ending)
+    assert ending.index("browser_close") < ending.index("answer"), (
+        "the close comes after the answer in the sentence, which is after the "
+        "model has stopped calling tools: %r" % ending)
+    for loophole in ("except", "unless", "only exception"):
+        assert loophole not in ending, (
+            "the close is phrased as an exception (%r), which is what a model "
+            "reaches for: %r" % (loophole, ending))
+
+
+async def test_the_brain_hands_the_link_instructions_to_the_loop():
+    """The loop can carry the instructions and the interface can still forget
+    to pass them: the brain is the one caller in the product, and this drives
+    it with a link that has some.
+
+    Known-bad: drop `instructions=` from the brain's call.
+    """
+    from invisible_playwright_mcp.agent import OpenRouterBrain
+
+    class LinkWithInstructions:
+        instructions = "Two browsers, main and support."
+
+        def __init__(self, mcp):
+            self.tools = tools_result(tool("browser_open")).tools
+            self.call = mcp.call_tool
+
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_open")), results={})
+    model = ScriptedModel([assistant_answer("done")])
+
+    async def say(kind, text):
+        pass
+
+    await OpenRouterBrain(model, "m").handle("go", LinkWithInstructions(mcp), say)
+    system = [m for m in model.requests[0]["messages"] if m["role"] == "system"]
+    assert len(system) == 1 and system[0]["content"].endswith("Two browsers, main and support."), (
+        "the interface's brain does not hand the server's instructions to the "
+        "loop: %r" % system[0]["content"][-80:])
+
+
+async def test_a_tool_the_model_remembers_and_this_server_lacks_gets_a_map():
+    """⛔ THE MODEL ASKED FOR `session_list` IN SIX RUNS OUT OF TWELVE, on a
+    page that never says the word. Earlier public versions of this server had
+    the session tools, a model trained on that repository still reaches for
+    them, and the server answered `Unknown tool: session_list` - a shrug, after
+    a round trip, and the model guessed again.
+
+    The loop knows the real list, so it answers itself: no call reaches the
+    server, the model is told that nothing has to be listed or started, and it
+    is handed the names it can use. The person watching sees the step fail
+    with that sentence rather than a bare error.
+
+    Known-bad, three: let the call through to the server; answer without the
+    real names; answer without saying the browsers are already there.
+    """
+    mcp = ScriptedMCP(tools=tools_result(tool("browser_navigate"), tool("browser_open")),
+                      results={})
+    model = ScriptedModel([
+        assistant_tool_calls(("c1", "session_list", "{}")),
+        assistant_answer("nothing to list"),
+    ])
+    seen = []
+
+    async def say(kind, text):
+        seen.append((kind, text))
+
+    convo = Conversation(model, "m")
+    tools = (await mcp.list_tools()).tools
+    await convo.run("go", mcp.call_tool, tools, say=say)
+
+    assert mcp.calls == [], (
+        "the call for a tool that does not exist went to the server: %r" % (mcp.calls,))
+    told = [m for m in model.requests[1]["messages"] if m["role"] == "tool"][-1]["content"]
+    assert "session_list" in told and "browser_navigate" in told and "browser_open" in told, (
+        "the model is not handed the real names: %r" % told)
+    assert "already there" in told and "main" in told and "support" in told, (
+        "the model is not told that the browsers exist and nothing has to be "
+        "started: %r" % told)
+    assert ("err", told) in seen, (
+        "the person watching does not see the step fail with the sentence: %r" % (seen,))
+
+
+def test_the_known_names_are_read_off_the_definitions_not_stored_beside_them():
+    """⛔ IT WAS THE ONLY ATTRIBUTE OF THIS CLASS NOT DECLARED IN `__init__`,
+    and it was assigned inside `if self.tool_defs is None` - the one branch
+    that BUILDS the definitions. So a conversation whose definitions arrived
+    any other way had no `known` at all, and the miss landed on the line that
+    tells a model it asked for a tool nobody has: an AttributeError raised
+    inside the handler for somebody else's mistake.
+
+    Declaring it as an empty list in `__init__` would have been worse than the
+    crash, because an empty list is a legal answer: every tool would be refused
+    as unknown, quietly. It is derived from `tool_defs` instead, so the two
+    cannot disagree and neither can be missing.
+
+    Known-bad, two: store it beside `tool_defs` again (the first assertion goes
+    back to AttributeError), or seed it with a list of its own that `tool_defs`
+    does not produce (the third stops agreeing).
+    """
+    convo = Conversation(ScriptedModel([]), "m")
+    assert convo.known == [], (
+        "a fresh conversation cannot say which tools it knows without raising")
+
+    convo.tool_defs = mcp_tools_to_openai(
+        [tool("browser_navigate"), tool("browser_open")])
+    assert convo.known == ["browser_navigate", "browser_open"], (
+        "the names were not read off the definitions: %r" % (convo.known,))
+
+    convo.tool_defs = mcp_tools_to_openai([tool("browser_click")])
+    assert convo.known == ["browser_click"], (
+        "the names did not follow the definitions changing, so they are a "
+        "second copy: %r" % (convo.known,))
+
+
+def test_the_instructions_open_by_saying_to_open_the_browser_first():
+    """The other half of the same defect, one step earlier: before the model
+    can reach for an old session tool, the first paragraph it reads names the
+    two browsers and says where to begin - `browser_open`, which since 0.53.0
+    is the only tool that opens one.
+
+    Known-bad: move the paragraph down, or drop the two names from it.
+    """
+    from invisible_playwright_mcp.mcp.server import INSTRUCTIONS
+    first = INSTRUCTIONS.split(chr(10) + chr(10))[0].lower()
+    assert "main" in first and "support" in first, (
+        "the instructions do not open by naming the two browsers: %r" % first)
+    assert "browser_open" in first and "before anything else" in first, (
+        "the opening does not say where to begin: %r" % first)
+
